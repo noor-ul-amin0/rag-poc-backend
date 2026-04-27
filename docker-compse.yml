@@ -1,7 +1,7 @@
 services:
   app:
     build: .
-    image: femsa-chatbot
+    image: ragpoc-backend:latest
     ports:
       - "50506:50506"
     env_file:
