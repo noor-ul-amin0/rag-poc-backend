@@ -1,0 +1,33 @@
+# Virtual env and Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Git and IDE
+.git/
+.gitignore
+.vscode/
+.idea/
+*.md
+
+# Docker
+Dockerfile*
+docker-compose*
+.dockerignore
+
+# Local / OS
+.DS_Store
+Thumbs.db
