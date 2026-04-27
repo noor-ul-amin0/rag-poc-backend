@@ -1,0 +1,24 @@
+{
+  "comment": "Configuration for DOCX and PDF ingestion pipeline",
+
+  "document_intelligence_service": "<your-document-intelligence-service>",
+  "document_intelligence_key": "<your-document-intelligence-key>",
+  "use_local_pdf_parser": false,
+  "process_figures": false,
+  "search_service": "<your-search-service>",
+  "search_index": "kb-docx-index",
+  "search_key": "<your-search-admin-key>",
+
+  "azure_openai_service": "<your-azure-openai-service>",
+  "azure_openai_endpoint": "https://<your-azure-openai-service>.openai.azure.com/",
+  "azure_openai_key": "<your-azure-openai-key>",
+  "azure_openai_api_version": "2024-06-01",
+  "azure_openai_embedding_deployment": "text-embedding-3-small",
+  "azure_openai_embedding_model": "text-embedding-3-small",
+  "azure_openai_embedding_dimensions": 1536,
+  "azure_openai_chat_deployment": "gpt-4o",
+  "azure_openai_chat_model": "gpt-4o",
+  "search_embedding_field": "embedding",
+
+  "category": "default"
+}
