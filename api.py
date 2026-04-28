@@ -1,11 +1,10 @@
 import asyncio
-import json
 import logging
 import mimetypes
-import os
-from pathlib import Path
 from typing import Any
-
+from pathlib import Path
+import json
+import os
 from azure.core.credentials import AzureKeyCredential
 from azure.search.documents.aio import SearchClient
 from azure.search.documents.models import VectorizedQuery
@@ -14,6 +13,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from openai import AsyncAzureOpenAI
 from pydantic import BaseModel, Field
+
+from config import get_settings
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("qa-api")
@@ -27,7 +28,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BASE_DIR = Path(__file__).resolve().parent
 RETRIEVAL_TOP_K = 10
 
 
@@ -40,14 +40,8 @@ class ChatRequest(BaseModel):
     messages: list[Message] = Field(..., min_length=1)
 
 
-def load_config(config_path: str = "config.json") -> dict[str, Any]:
-    resolved_path = Path(config_path)
-    if not resolved_path.is_absolute():
-        resolved_path = BASE_DIR / resolved_path
-    if not resolved_path.exists():
-        raise FileNotFoundError(f"Configuration file not found: {resolved_path}")
-    with open(resolved_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+def load_config() -> dict[str, Any]:
+    return get_settings().model_dump()
 
 
 def get_required_config(config: dict[str, Any], key: str) -> str:
