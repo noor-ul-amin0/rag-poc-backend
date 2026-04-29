@@ -10,8 +10,9 @@ from azure.search.documents.aio import SearchClient
 from azure.search.documents.models import VectorizedQuery
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+from fastapi.responses import Response, JSONResponse, FileResponse, StreamingResponse
 from openai import AsyncAzureOpenAI
+from openai.types.chat import ChatCompletionMessageParam
 from pydantic import BaseModel, Field
 
 from config import get_settings
@@ -168,17 +169,83 @@ async def retrieve_documents(
     return docs
 
 
+async def rewrite_query_for_retrieval(
+    *,
+    config: dict[str, Any],
+    openai_client: AsyncAzureOpenAI,
+    messages: list[dict[str, str]],
+) -> str:
+    latest_user_message = (messages[-1].get("content") or "").strip()
+    if not latest_user_message:
+        return latest_user_message
+
+    chat_deployment = get_required_config(config, "azure_openai_chat_deployment")
+    recent_messages = messages[-8:]
+    history_block = "\n".join(
+        f"{m.get('role', 'user').upper()}: {(m.get('content') or '').strip()}" for m in recent_messages
+    )
+
+    rewrite_system_prompt = """
+You are a retrieval query optimizer for a domain-specific RAG system.
+Your job is to rewrite the latest user message into the best possible standalone search query for
+vector/semantic search over documentation chunks.
+
+You must do ALL of the following in one rewrite:
+
+1. RESOLVE CONTEXT — If the message references prior turns (e.g. "for both", "that one", "same",
+   "which page?", pronouns, or the assistant's clarifying options), resolve those references using
+   the conversation history so the query is fully self-contained.
+
+2. IMPROVE CLARITY — Expand vague or abbreviated phrasing into specific, information-rich language.
+   For example: "onhand?" → "What is the Onhand measure and how is it calculated?"
+
+Hard constraints:
+- DO NOT change the user's intent.
+- DO NOT answer the question.
+- DO NOT add facts or topics not implied by the conversation.
+- Return ONLY the rewritten query text — no explanation, no prefix, no quotes.
+""".strip()
+
+    rewrite_user_prompt = (
+        "Conversation (most recent last):\n"
+        f"{history_block}\n\n"
+        "Rewrite the latest USER message into an optimized standalone retrieval query."
+    )
+
+    try:
+        completion = await openai_client.chat.completions.create(
+            model=chat_deployment,
+            messages=[
+                {"role": "system", "content": rewrite_system_prompt},
+                {"role": "user", "content": rewrite_user_prompt},
+            ],
+            temperature=0,
+            max_tokens=128,
+        )
+        rewritten = (completion.choices[0].message.content or "").strip().strip('"')
+        if not rewritten:
+            return latest_user_message
+        logger.info(
+            "Retrieval query rewrite | original='%s' | rewritten='%s'",
+            latest_user_message,
+            rewritten,
+        )
+        return rewritten
+    except Exception:
+        logger.exception("Query rewrite failed, falling back to latest user message")
+        return latest_user_message
+
+
 async def generate_answer(
     *,
     config: dict[str, Any],
     openai_client: AsyncAzureOpenAI,
     messages: list[dict[str, str]],
     citations: list[dict[str, Any]],
+    resolved_question: str,
 ) -> str:
     chat_deployment = get_required_config(config, "azure_openai_chat_deployment")
     chat_model = str(config.get("azure_openai_chat_model", "gpt-4o-mini"))
-
-    last_user_message = messages[-1]["content"]
 
     def _fmt(c: dict[str, Any], idx: int) -> str:
       parts = [f"[{idx}]"]
@@ -321,13 +388,16 @@ SECTION 8 — TONE & STYLE
 </context>
 """.strip()
 
-    qa_messages = [
-    {"role": "system", "content": system_prompt.format(source_block=context_block)},
-    {
-        "role": "user",
-        "content": f"Answer the following question using only the context provided in your instructions:\n\n{last_user_message}",
-    },
-]
+    qa_messages: list[ChatCompletionMessageParam] = [
+        {"role": "system", "content": system_prompt.format(source_block=context_block)},
+        {
+            "role": "user",
+            "content": (
+                "Answer the following question using only the context provided in your instructions.\n\n"
+                f"{resolved_question}"
+            ),
+        },
+    ]
 
     completion = await openai_client.chat.completions.create(
         model=chat_deployment,
@@ -344,9 +414,9 @@ async def generate_answer_stream(
     openai_client: AsyncAzureOpenAI,
     messages: list[dict[str, str]],
     citations: list[dict[str, Any]],
+    resolved_question: str,
 ) -> AsyncIterator[str]:
     chat_deployment = get_required_config(config, "azure_openai_chat_deployment")
-    last_user_message = messages[-1]["content"]
 
     def _fmt(c: dict[str, Any], idx: int) -> str:
         parts = [f"[{idx}]"]
@@ -481,11 +551,14 @@ SECTION 8 — TONE & STYLE
 </context>
 """.strip()
 
-    qa_messages = [
+    qa_messages: list[ChatCompletionMessageParam] = [
         {"role": "system", "content": system_prompt.format(source_block=context_block)},
         {
             "role": "user",
-            "content": f"Answer the following question using only the context provided in your instructions:\n\n{last_user_message}",
+            "content": (
+                "Answer the following question using only the context provided in your instructions.\n\n"
+                f"{resolved_question}"
+            ),
         },
     ]
 
@@ -504,7 +577,14 @@ SECTION 8 — TONE & STYLE
             yield delta
 
 
-def build_chat_response(*, answer: str, citations: list[dict[str, Any]], query: str, docs_count: int) -> dict[str, Any]:
+def build_chat_response(
+    *,
+    answer: str,
+    citations: list[dict[str, Any]],
+    query: str,
+    retrieval_query: str,
+    docs_count: int,
+) -> dict[str, Any]:
     return {
         "message": {"role": "assistant", "content": answer},
         "context": {
@@ -520,7 +600,8 @@ def build_chat_response(*, answer: str, citations: list[dict[str, Any]], query: 
                 "citations": citations,
             },
             "thoughts": [
-                {"title": "Search query", "description": query},
+                {"title": "User query", "description": query},
+                {"title": "Retrieval query", "description": retrieval_query},
                 {"title": "Retrieved documents", "description": f"Count: {docs_count}"},
             ],
         },
@@ -551,13 +632,19 @@ async def chat(chat_request: ChatRequest) -> JSONResponse:
     config: dict[str, Any] = app.state.APP_CONFIG
     search_client_instance: SearchClient = app.state.SEARCH_CLIENT
     openai_client_instance: AsyncAzureOpenAI = app.state.OPENAI_CLIENT
+    message_payload = [{"role": m.role, "content": m.content} for m in messages]
 
     try:
+        retrieval_query = await rewrite_query_for_retrieval(
+            config=config,
+            openai_client=openai_client_instance,
+            messages=message_payload,
+        )
         docs = await retrieve_documents(
             config=config,
             search_client=search_client_instance,
             openai_client=openai_client_instance,
-            query=query,
+            query=retrieval_query,
         )
         citations = build_citations(docs)
         for c in citations:
@@ -572,14 +659,21 @@ async def chat(chat_request: ChatRequest) -> JSONResponse:
         answer = await generate_answer(
             config=config,
             openai_client=openai_client_instance,
-            messages=[{"role": m.role, "content": m.content} for m in messages],
+            messages=message_payload,
             citations=citations,
+            resolved_question=retrieval_query,
         )
 
         # log the generated answer to the console.
         logger.info("Full generated answer: '%s'", answer)
 
-        response = build_chat_response(answer=answer, citations=citations, query=query, docs_count=len(docs))
+        response = build_chat_response(
+            answer=answer,
+            citations=citations,
+            query=query,
+            retrieval_query=retrieval_query,
+            docs_count=len(docs),
+        )
         return JSONResponse(response)
     except Exception as exc:
         logger.exception("/chat failed")
@@ -587,7 +681,7 @@ async def chat(chat_request: ChatRequest) -> JSONResponse:
 
 
 @app.post("/chat/stream", response_model=None)
-async def chat_stream(chat_request: ChatRequest) -> StreamingResponse:
+async def chat_stream(chat_request: ChatRequest) -> Response:
     messages = chat_request.messages
 
     if not messages or not isinstance(messages, list):
@@ -605,14 +699,20 @@ async def chat_stream(chat_request: ChatRequest) -> StreamingResponse:
     config: dict[str, Any] = app.state.APP_CONFIG
     search_client_instance: SearchClient = app.state.SEARCH_CLIENT
     openai_client_instance: AsyncAzureOpenAI = app.state.OPENAI_CLIENT
+    message_payload = [{"role": m.role, "content": m.content} for m in messages]
 
     async def stream() -> AsyncIterator[bytes]:
         try:
+            retrieval_query = await rewrite_query_for_retrieval(
+                config=config,
+                openai_client=openai_client_instance,
+                messages=message_payload,
+            )
             docs = await retrieve_documents(
                 config=config,
                 search_client=search_client_instance,
                 openai_client=openai_client_instance,
-                query=query,
+                query=retrieval_query,
             )
             citations = build_citations(docs)
 
@@ -620,15 +720,22 @@ async def chat_stream(chat_request: ChatRequest) -> StreamingResponse:
             async for delta in generate_answer_stream(
                 config=config,
                 openai_client=openai_client_instance,
-                messages=[{"role": m.role, "content": m.content} for m in messages],
+                messages=message_payload,
                 citations=citations,
+                resolved_question=retrieval_query,
             ):
                 full_answer_parts.append(delta)
                 yield (json.dumps({"type": "delta", "content": delta}) + "\n").encode("utf-8")
 
             answer = "".join(full_answer_parts).strip() or "I could not generate an answer."
             logger.info("Full generated streaming answer: '%s'", answer)
-            response_payload = build_chat_response(answer=answer, citations=citations, query=query, docs_count=len(docs))
+            response_payload = build_chat_response(
+                answer=answer,
+                citations=citations,
+                query=query,
+                retrieval_query=retrieval_query,
+                docs_count=len(docs),
+            )
             yield (json.dumps({"type": "done", "response": response_payload}) + "\n").encode("utf-8")
         except Exception as exc:
             logger.exception("/chat/stream failed")
