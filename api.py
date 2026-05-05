@@ -1,7 +1,7 @@
 import logging
 import mimetypes
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, cast
 from pathlib import Path
 import json
 import os
@@ -62,6 +62,7 @@ app.add_middleware(
 )
 
 RETRIEVAL_TOP_K = 15
+ANSWER_HISTORY_MESSAGES = 5
 
 
 class Message(BaseModel):
@@ -197,10 +198,12 @@ You must do ALL of the following in one rewrite:
    the conversation history so the query is fully self-contained.
 
 2. IMPROVE CLARITY — Expand vague or abbreviated phrasing into specific, information-rich language.
-   For example: "onhand?" → "What is the Onhand measure and how is it calculated?"
+   For example: "onhand?" → "How is Onhand measure calculated?"
 
 Hard constraints:
+- Keep original meaning and scope unchanged
 - DO NOT change the user's intent.
+- Prefer lexical overlap with the user's original words.
 - DO NOT answer the question.
 - DO NOT add facts or topics not implied by the conversation.
 - Return ONLY the rewritten query text — no explanation, no prefix, no quotes.
@@ -234,6 +237,47 @@ Hard constraints:
     except Exception:
         logger.exception("Query rewrite failed, falling back to latest user message")
         return latest_user_message
+
+
+def build_answer_messages(
+    *,
+    system_prompt: str,
+    context_block: str,
+    messages: list[dict[str, str]],
+    resolved_question: str,
+) -> list[ChatCompletionMessageParam]:
+    qa_messages: list[ChatCompletionMessageParam] = [
+        {"role": "system", "content": system_prompt.format(source_block=context_block)},
+    ]
+
+    # Add a small, bounded history window (excluding the latest user turn) to
+    # preserve conversational continuity without diluting grounding.
+    history_window = messages[-(ANSWER_HISTORY_MESSAGES + 1) : -1]
+    for message in history_window:
+        role = (message.get("role") or "").strip().lower()
+        content = (message.get("content") or "").strip()
+        if role not in {"user", "assistant"} or not content:
+            continue
+        qa_messages.append(
+            cast(
+                ChatCompletionMessageParam,
+                {
+                    "role": "user" if role == "user" else "assistant",
+                    "content": content,
+                },
+            )
+        )
+
+    qa_messages.append(
+        {
+            "role": "user",
+            "content": (
+                "Answer the following question using only the context provided in your instructions.\n\n"
+                f"{resolved_question}"
+            ),
+        }
+    )
+    return qa_messages
 
 
 async def generate_answer(
@@ -371,8 +415,7 @@ SECTION 7 — MISSING INFORMATION & FALLBACKS
 - If the context partially answers the question: answer the supported parts and
   explicitly flag what is missing.
 - If the context does not answer the question at all, respond exactly:
-  "I couldn't find a match in the current context — this may belong to another
-  category or need rephrasing."
+  "I couldn't find a match in the current context."
 - Never fabricate logic, field names, or formulas not present in the context.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -388,16 +431,12 @@ SECTION 8 — TONE & STYLE
 </context>
 """.strip()
 
-    qa_messages: list[ChatCompletionMessageParam] = [
-        {"role": "system", "content": system_prompt.format(source_block=context_block)},
-        {
-            "role": "user",
-            "content": (
-                "Answer the following question using only the context provided in your instructions.\n\n"
-                f"{resolved_question}"
-            ),
-        },
-    ]
+    qa_messages = build_answer_messages(
+        system_prompt=system_prompt,
+        context_block=context_block,
+        messages=messages,
+        resolved_question=resolved_question,
+    )
 
     completion = await openai_client.chat.completions.create(
         model=chat_deployment,
@@ -466,8 +505,7 @@ RULE A — Page + Measure both specified:
 2. Within that filtered set, find the chunk matching the measure name.
 3. Answer EXCLUSIVELY from that chunk. Never blend logic from the same measure
    on a different page, even if it appears elsewhere in the context.
-4. Open your answer with: "From the **<Page Name>** ([N]):"
-5. If the page exists in context but the measure is absent on that page, respond:
+4. If the page exists in context but the measure is absent on that page, respond:
    "The measure '<measure>' was not found on <page> in the provided context.
     It does appear on: <list other pages found>."
 
@@ -489,9 +527,16 @@ RULE C — Neither page nor measure clearly specified:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 SECTION 4 — CITATION
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- Cite every chunk you draw from inline using [N] immediately after the claim.
-- Multiple sources for one fact: [2][5].
-- Do NOT add a bibliography or reference list at the end.
+- The context block contains chunks labeled as [1], [2], [3], etc.
+  These are the ONLY valid citation labels.
+- Every sentence or bullet point that states a fact MUST end with its citation label(s),
+  e.g. [1], [2], or [1][3].
+- A response with any uncited factual claim is considered incomplete and invalid.
+- Place citations inline, immediately after the claim they support — never grouped at the end.
+- Single-fact prose answers require a citation just as much as multi-point answers.
+  Example: "The threshold is 500 units. [2]"
+- If multiple chunks support one claim, list all labels: [1][3].
+- Do NOT invent citation labels beyond those provided in the context.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 SECTION 5 — RESPONSE FORMAT
@@ -534,8 +579,7 @@ SECTION 7 — MISSING INFORMATION & FALLBACKS
 - If the context partially answers the question: answer the supported parts and
   explicitly flag what is missing.
 - If the context does not answer the question at all, respond exactly:
-  "I couldn't find a match in the current context — this may belong to another
-  category or need rephrasing."
+  "I'm sorry. This information is not mentioned in the sources available to me."
 - Never fabricate logic, field names, or formulas not present in the context.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -551,16 +595,12 @@ SECTION 8 — TONE & STYLE
 </context>
 """.strip()
 
-    qa_messages: list[ChatCompletionMessageParam] = [
-        {"role": "system", "content": system_prompt.format(source_block=context_block)},
-        {
-            "role": "user",
-            "content": (
-                "Answer the following question using only the context provided in your instructions.\n\n"
-                f"{resolved_question}"
-            ),
-        },
-    ]
+    qa_messages = build_answer_messages(
+        system_prompt=system_prompt,
+        context_block=context_block,
+        messages=messages,
+        resolved_question=resolved_question,
+    )
 
     stream = await openai_client.chat.completions.create(
         model=chat_deployment,
