@@ -316,6 +316,7 @@ async def index_sections(config: dict, sections: list):
                         SimpleField(name="sourcepage", type=SearchFieldDataType.String, filterable=True, facetable=True),
                         SimpleField(name="sourcefile", type=SearchFieldDataType.String, filterable=True, facetable=True),
                         SearchField(name="page_num", type=SearchFieldDataType.Int32, filterable=True, sortable=True),
+                        SearchField(name="chunk_index", type=SearchFieldDataType.Int32, filterable=True, sortable=True),
                         SimpleField(name="images", type=SearchFieldDataType.String, filterable=False),
                         make_embedding_field(embedding_field_name, embedding_dimensions),
                     ],
@@ -362,6 +363,12 @@ async def index_sections(config: dict, sections: list):
                         SearchableField(name="breadcrumb", type=SearchFieldDataType.String, filterable=True)
                     )
                     needs_update = True
+                if "chunk_index" not in existing_field_names:
+                    logger.info("Index '%s' missing 'chunk_index' field. Adding it.", index_name)
+                    existing_index.fields.append(
+                        SearchField(name="chunk_index", type=SearchFieldDataType.Int32, filterable=True, sortable=True)
+                    )
+                    needs_update = True
                 if needs_update:
                     await search_index_client.create_or_update_index(existing_index)
                     logger.info("Updated index '%s' schema", index_name)
@@ -398,6 +405,7 @@ async def index_sections(config: dict, sections: list):
                     "sourcepage": sourcepage_from_file_page(source_filename, page=section.chunk.page_num),
                     "sourcefile": source_filename,
                     "page_num": section.chunk.page_num,
+                    "chunk_index": section_index,
                     "images": json.dumps(images_data),
                 }
             )

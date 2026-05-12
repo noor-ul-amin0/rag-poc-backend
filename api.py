@@ -125,6 +125,7 @@ def build_citations(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "breadcrumb": (str(doc.get("breadcrumb") or "")).strip(),
                 "content": (str(doc.get("content") or "")).strip(),
                 "page_num": int(doc.get("page_num") or 0),
+                "chunk_index": int(doc.get("chunk_index") or 0),
                 "extension": ext,
                 "images": images,
             }
@@ -161,7 +162,7 @@ async def retrieve_documents(
         query_type="semantic",
         semantic_configuration_name="default",
         top=RETRIEVAL_TOP_K,
-        select=["id", "content", "breadcrumb", "sourcepage", "sourcefile", "category", "page_num", "images"],
+        select=["id", "content", "breadcrumb", "sourcepage", "sourcefile", "category", "page_num", "chunk_index", "images"],
     )
 
     docs: list[dict[str, Any]] = []
