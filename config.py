@@ -56,6 +56,20 @@ class Settings(BaseSettings):
     )
     category: str = Field(default="default", validation_alias=AliasChoices("category", "CATEGORY"))
 
+    # DOCX image preprocessing (optional)
+    enable_docx_image_preprocessing: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("enable_docx_image_preprocessing", "ENABLE_DOCX_IMAGE_PREPROCESSING"),
+    )
+    azure_storage_connection_string: str = Field(
+        default="",
+        validation_alias=AliasChoices("azure_storage_connection_string", "AZURE_STORAGE_CONNECTION_STRING"),
+    )
+    azure_storage_images_container_name: str = Field(
+        default="document-images",
+        validation_alias=AliasChoices("azure_storage_images_container_name", "AZURE_STORAGE_IMAGES_CONTAINER_NAME"),
+    )
+
     @model_validator(mode="after")
     def validate_required_fields(self) -> "Settings":
         required_fields = (
@@ -68,6 +82,10 @@ class Settings(BaseSettings):
         missing = [field for field in required_fields if not getattr(self, field).strip()]
         if missing:
             raise ValueError(f"Missing required settings: {', '.join(missing)}")
+        if self.enable_docx_image_preprocessing and not self.azure_storage_connection_string.strip():
+            raise ValueError(
+                "AZURE_STORAGE_CONNECTION_STRING is required when ENABLE_DOCX_IMAGE_PREPROCESSING is true"
+            )
         return self
 
 

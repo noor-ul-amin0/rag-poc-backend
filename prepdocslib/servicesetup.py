@@ -20,6 +20,7 @@ def build_file_processors(
     document_intelligence_key: str | None = None,
     use_local_pdf_parser: bool = False,
     process_figures: bool = False,
+    preprocess_docx_images: bool = False,
 ) -> dict[str, FileProcessor]:
     """Build file processors for DOCX and PDF documents."""
     sentence_text_splitter = SentenceTextSplitter()
@@ -36,6 +37,7 @@ def build_file_processors(
             endpoint=f"https://{document_intelligence_service}.cognitiveservices.azure.com/",
             credential=credential,
             process_figures=process_figures,
+            preprocess_docx_images=preprocess_docx_images,
         )
 
     # Set up PDF parser (prioritize Document Intelligence, fallback to local)

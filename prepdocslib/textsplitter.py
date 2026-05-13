@@ -37,7 +37,7 @@ CJK_SENTENCE_ENDINGS = ["。", "！", "？", "‼", "⁇", "⁈", "⁉"]
 bpe = tiktoken.encoding_for_model(ENCODING_MODEL)
 
 DEFAULT_OVERLAP_PERCENT = 10
-DEFAULT_SECTION_LENGTH = 2000
+DEFAULT_SECTION_LENGTH = 2500
 
 
 def _safe_concat(a: str, b: str) -> str:
@@ -118,7 +118,7 @@ class _ChunkBuilder:
 class SentenceTextSplitter(TextSplitter):
     """Splits pages into semantic chunks using sentence-aware boundaries."""
 
-    def __init__(self, max_tokens_per_section: int = 800):
+    def __init__(self, max_tokens_per_section: int = 1000):
         self.sentence_endings = STANDARD_SENTENCE_ENDINGS + CJK_SENTENCE_ENDINGS
         self.word_breaks = STANDARD_WORD_BREAKS + CJK_WORD_BREAKS
         self.max_section_length = DEFAULT_SECTION_LENGTH

@@ -1,3 +1,4 @@
+import asyncio
 import html
 import io
 import logging
@@ -118,11 +119,13 @@ class DocumentAnalysisParser(Parser):
         credential: AsyncTokenCredential | AzureKeyCredential,
         model_id: str = "prebuilt-layout",
         process_figures: bool = False,
+        preprocess_docx_images: bool = False,
     ) -> None:
         self.model_id = model_id
         self.endpoint = endpoint
         self.credential = credential
         self.process_figures = process_figures
+        self.preprocess_docx_images = preprocess_docx_images
 
     async def parse(self, content: IO) -> AsyncGenerator[Page, None]:
         logger.info("Extracting text from '%s' using Azure Document Intelligence", content.name)
@@ -135,6 +138,35 @@ class DocumentAnalysisParser(Parser):
             except Exception:
                 pass
             content_bytes = content.read()
+
+            # Pre-process DOCX to extract embedded images, upload them to blob
+            # storage, and replace image runs with markdown image tags so that
+            # Azure DI can include them in the parsed markdown output.
+            file_name = getattr(content, "name", "") or ""
+            if self.preprocess_docx_images and file_name.lower().endswith(".docx"):
+                try:
+                    from .image_extraction import extract_and_replace_images
+                    from config import get_settings
+
+                    _settings = get_settings()
+                    content_bytes, image_urls = await asyncio.to_thread(
+                        extract_and_replace_images,
+                        content_bytes,
+                        file_name,
+                        _settings.azure_storage_connection_string,
+                        _settings.azure_storage_images_container_name,
+                    )
+                    logger.info(
+                        "DOCX image preprocessing complete for '%s': %d image(s) extracted",
+                        file_name,
+                        len(image_urls),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "DOCX image preprocessing failed for '%s': %s. Proceeding without image extraction.",
+                        file_name,
+                        exc,
+                    )
 
             # Build a heading-level correction map from the native document parser.
             # Azure DI's markdown heading levels can diverge from the actual Word/PDF

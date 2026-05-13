@@ -38,6 +38,7 @@ from openai import AsyncAzureOpenAI
 from prepdocslib.listfilestrategy import File, LocalListFileStrategy
 from prepdocslib.servicesetup import build_file_processors
 from prepdocslib.textprocessor import process_text
+from config import get_settings
 
 # Setup logging
 logging.basicConfig(
@@ -201,7 +202,10 @@ async def parse_and_chunk_documents(config: dict, input_dir: str) -> list:
     
     # Get credentials
     azure_credential = DefaultAzureCredential()
-    
+
+    # Read feature flags from environment settings
+    app_settings = get_settings()
+
     # Build file processors
     file_processors = build_file_processors(
         azure_credential=azure_credential,
@@ -209,6 +213,7 @@ async def parse_and_chunk_documents(config: dict, input_dir: str) -> list:
         document_intelligence_key=config.get("document_intelligence_key"),
         use_local_pdf_parser=config.get("use_local_pdf_parser", False),
         process_figures=config.get("process_figures", False),
+        preprocess_docx_images=app_settings.enable_docx_image_preprocessing,
     )
     
     logger.info("Available file processors: %s", list(file_processors.keys()))

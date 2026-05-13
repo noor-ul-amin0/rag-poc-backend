@@ -5,6 +5,7 @@ from typing import Any, AsyncIterator, cast
 from pathlib import Path
 import json
 import os
+import re
 from azure.core.credentials import AzureKeyCredential
 from azure.search.documents.aio import SearchClient
 from azure.search.documents.models import VectorizedQuery
@@ -63,6 +64,10 @@ app.add_middleware(
 
 RETRIEVAL_TOP_K = 15
 ANSWER_HISTORY_MESSAGES = 5
+IMAGE_LINK_RE = re.compile(
+    r"!\[[^\]]*\]\(https?://[^)]+\)|(?<!!)\[Image\d+\]\(https?://[^)]+\)",
+    re.IGNORECASE,
+)
 
 
 class Message(BaseModel):
@@ -131,6 +136,35 @@ def build_citations(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
             }
         )
     return citations
+
+
+def extract_cited_image_markdown(answer: str, citations: list[dict[str, Any]]) -> list[str]:
+    """Return image markdown from chunks the answer actually cites."""
+    cited_ids = {int(match) for match in re.findall(r"\[(\d+)\]", answer)}
+    image_lines: list[str] = []
+    seen: set[str] = set()
+
+    for citation in citations:
+        citation_id = int(citation.get("id") or 0)
+        if citation_id not in cited_ids:
+            continue
+
+        content = str(citation.get("content") or "")
+        for match in IMAGE_LINK_RE.findall(content):
+            image_markdown = match.strip()
+            if image_markdown in seen or image_markdown in answer:
+                continue
+            seen.add(image_markdown)
+            image_lines.append(image_markdown)
+
+    return image_lines
+
+
+def append_cited_images(answer: str, citations: list[dict[str, Any]]) -> str:
+    image_lines = extract_cited_image_markdown(answer, citations)
+    if not image_lines:
+        return answer
+    return f"{answer.rstrip()}\n\n" + "\n\n".join(image_lines)
 
 
 async def retrieve_documents(
@@ -380,6 +414,7 @@ SECTION 5 — RESPONSE FORMAT
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 For measure_table chunks, format each entry as a flat bullet list (never nested).
 Omit any field that is absent from the chunk.
+Never output placeholder text for missing fields (for example: "Not explicitly mentioned", "N/A", "Unknown", "Not provided").
 
 English:
 - **Display Name**: [value]
@@ -399,6 +434,7 @@ Formatting rules (enforced in ALL languages):
 - Never wrap labels in any quotation marks (", ', «, »).
 - All bullet points must be flat — never nest a bullet under another bullet.
 - Always use: `- **Label**: Value`
+- If a value is missing, omit that bullet entirely.
 - Use bullet points or numbered lists for multi-step logic or calculation flows.
 - For prose chunks, write in clear paragraphs — no unnecessary bullet fragmentation.
 
@@ -468,6 +504,7 @@ async def generate_answer_stream(
         return "\n".join(parts)
 
     source_block = "\n\n---\n\n".join(_fmt(c, idx) for idx, c in enumerate(citations, start=1))
+    logger.info("=== SOURCE BLOCK FED TO LLM ===\n%s\n===============================", source_block)
     context_block = f"<context>\n{source_block}\n</context>"
 
     system_prompt = """
@@ -544,25 +581,27 @@ SECTION 5 — RESPONSE FORMAT
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 For measure_table chunks, format each entry as a flat bullet list (never nested).
 Omit any field that is absent from the chunk.
+Never output placeholder text for missing fields (for example: "Not explicitly mentioned", "N/A", "Unknown", "Not provided").
 
 English:
 - **Display Name**: [value]
 - **Base or Calculated**: It is a [value] measure.
-- **Logic Details**: [value]
 - **File Source**: [value]
+- **Logic Details**: [value]
 - **Calculation Logic**: [value]
 
 Spanish:
 - **Nombre para Mostrar**: [value]
 - **Base o Calculada**: Es una medida [value].
-- **Detalles de Lógica**: [value]
 - **Archivo de Origen**: [value]
+- **Detalles de Lógica**: [value]
 - **Lógica de Cálculo**: [value]
 
 Formatting rules (enforced in ALL languages):
 - Never wrap labels in any quotation marks (", ', «, »).
 - All bullet points must be flat — never nest a bullet under another bullet.
 - Always use: `- **Label**: Value`
+- If a value is missing, omit that bullet entirely.
 - Use bullet points or numbered lists for multi-step logic or calculation flows.
 - For prose chunks, write in clear paragraphs — no unnecessary bullet fragmentation.
 
@@ -575,7 +614,27 @@ SECTION 6 — LANGUAGE
   original form regardless of response language.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 7 — MISSING INFORMATION & FALLBACKS
+SECTION 7 — IMAGES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Images are ONLY included when they appear in a chunk that directly and substantively
+  answers the user's question — not merely because that chunk was retrieved.
+- Before including any image, ask internally: "Does this chunk answer the question,
+  or does it only share keywords?" If the chunk does not directly answer the question,
+  do NOT include its images, even if the image markdown is present in the context.
+- If the answering chunk contains image markdown
+  (e.g., `![Image](https://example.com/image.png)` or
+  `[![Image](https://example.com/image.png)](link)`),
+  you MUST reproduce the exact image Markdown syntax verbatim — same URL, same alt text,
+  no changes.
+- Place each image as its own paragraph: one blank line before and one blank line after.
+  Do NOT wrap image lines inside bullet or numbered lists.
+- Do NOT add a generic section heading such as "Images" or "Figures" unless that exact
+  heading appears verbatim in the context next to those images.
+- Do NOT describe, paraphrase, or summarize images — reproduce the exact Markdown or omit.
+- This rule takes precedence over conciseness guidelines.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECTION 8 — MISSING INFORMATION & FALLBACKS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 - If the context partially answers the question: answer the supported parts and
   explicitly flag what is missing.
@@ -584,7 +643,7 @@ SECTION 7 — MISSING INFORMATION & FALLBACKS
 - Never fabricate logic, field names, or formulas not present in the context.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SECTION 8 — TONE & STYLE
+SECTION 9 — TONE & STYLE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 - Professional, helpful, and patient.
 - Concise and direct — avoid restating the question or padding the answer.
@@ -626,6 +685,7 @@ def build_chat_response(
     retrieval_query: str,
     docs_count: int,
 ) -> dict[str, Any]:
+    answer = append_cited_images(answer, citations)
     return {
         "message": {"role": "assistant", "content": answer},
         "context": {
