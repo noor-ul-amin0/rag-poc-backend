@@ -205,6 +205,195 @@ async def retrieve_documents(
     return docs
 
 
+# ---------------------------------------------------------------------------
+# Clarification pre-check  (LLM-as-judge — Option B)
+# ---------------------------------------------------------------------------
+
+def _extract_page_names(citations: list[dict[str, Any]]) -> list[str]:
+    """Return the first breadcrumb segment (page title) for every citation that
+    has a non-empty breadcrumb.  Duplicates are preserved so the caller can
+    decide how to aggregate them."""
+    pages: list[str] = []
+    for c in citations:
+        breadcrumb = (c.get("breadcrumb") or "").strip()
+        if not breadcrumb:
+            continue
+        first_segment = breadcrumb.split(">")[0].strip()
+        if first_segment:
+            pages.append(first_segment)
+    return pages
+
+
+_CLARIFICATION_JUDGE_SYSTEM_PROMPT = """\
+You are a disambiguation judge for a RAG system.
+
+TASK
+----
+You receive:
+  • A user query
+  • A list of Location breadcrumbs from retrieved knowledge-base chunks.
+
+Each breadcrumb starts with a **Page title** (the first segment before the first ">").
+
+Your job:
+
+1. Identify which **distinct pages** (first breadcrumb segments) contain chunks that
+   are **relevant to the user's query**.  Ignore chunks whose content clearly does NOT
+   match the queried measure/topic — base this only on the breadcrumb information provided.
+
+2. If the user's query **already names or implies a specific page**, treat it as the
+   target page and set `requires_clarification` to `false`.
+
+   Apply **fuzzy, intent-based matching** — do NOT require an exact string match.
+   Consider: case-insensitivity, partial word overlap, abbreviations, and common
+   shorthand.  Examples of what SHOULD match:
+     • "summary page"       → "Summary Page Overview"       ✅
+     • "AO base"            → "AO BASE Measures Examples"   ✅
+     • "AO base measures"   → "AO BASE Measures Examples"   ✅
+     • "warehouse"          → "Warehouse Page"              ✅
+     • "Excess"             → "Excess Page"                 ✅
+     • "criticos"           → "Criticos Page"               ✅
+
+   Things that are NOT page references (they refer to measures, tables, or data):
+     • "custorders table"   ❌
+     • "onhand"             ❌  (a measure name, not a page)
+
+3. If exactly ONE distinct relevant page exists → `requires_clarification: false`.
+
+4. If the user's query references **multiple pages** or asks about **all pages**
+   (e.g. "on summary and warehouse pages", "across all pages", "on every page",
+   "compare on AO base and criticos"), set `requires_clarification` to `false`.
+   The user has already indicated they want information from more than one page,
+   so no disambiguation is needed.
+
+5. If MULTIPLE distinct relevant pages exist AND the user did NOT specify any page →
+   `requires_clarification: true`.  Build a `followup` question listing the pages.
+
+6. Respond in the **same language as the user's query**.
+
+OUTPUT — respond with ONLY a JSON object, no markdown fences, no explanation:
+{
+  "requires_clarification": true/false,
+  "reasoning": "<brief explanation>",
+  "score": <float 0-1 representing confidence>,
+  "distinct_pages": ["Page A", "Page B"],
+  "followup": "<clarification question for the user, or empty string>"
+}
+"""
+
+
+async def check_clarification_needed(
+    *,
+    config: dict[str, Any],
+    openai_client: AsyncAzureOpenAI,
+    user_query: str,
+    citations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Run a lightweight LLM pre-check to decide if the user must disambiguate
+    which page they are asking about.
+
+    Returns a dict with at least:
+      - requires_clarification  (bool)
+      - followup                (str)
+      - reasoning               (str)
+      - score                   (float)
+      - distinct_pages          (list[str])
+    """
+
+    # ── Gate 1: feature flag ──────────────────────────────────────────────
+    if not config.get("enable_clarification_precheck", True):
+        logger.info("Clarification pre-check is DISABLED by config flag.")
+        return {
+            "requires_clarification": False,
+            "reasoning": "Pre-check disabled by config.",
+            "score": 0.0,
+            "distinct_pages": [],
+            "followup": "",
+        }
+
+    # ── Gate 2: extract distinct pages from breadcrumbs ───────────────────
+    all_pages = _extract_page_names(citations)
+    distinct_pages = sorted(set(p.lower() for p in all_pages))
+    distinct_pages_original = sorted(
+        set(all_pages), key=lambda p: p.lower()
+    )
+
+    if len(distinct_pages) <= 1:
+        page_label = distinct_pages_original[0] if distinct_pages_original else "N/A"
+        logger.info(
+            "Clarification pre-check: only %d distinct page(s) found (%s). Skipping judge.",
+            len(distinct_pages),
+            page_label,
+        )
+        return {
+            "requires_clarification": False,
+            "reasoning": f"All retrieved chunks belong to a single page: {page_label}.",
+            "score": 1.0,
+            "distinct_pages": distinct_pages_original,
+            "followup": "",
+        }
+
+    # ── Gate 3: call the LLM judge ────────────────────────────────────────
+    breadcrumb_list = "\n".join(
+        f"  - {c.get('breadcrumb', '')}" for c in citations if c.get("breadcrumb")
+    )
+    user_prompt = (
+        f"User query: {user_query}\n\n"
+        f"Retrieved chunk locations:\n{breadcrumb_list}"
+    )
+
+    chat_deployment = get_required_config(config, "azure_openai_chat_deployment")
+    try:
+        completion = await openai_client.chat.completions.create(
+            model=chat_deployment,
+            messages=[
+                {"role": "system", "content": _CLARIFICATION_JUDGE_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0,
+            max_tokens=512,
+            response_format={"type": "json_object"},
+        )
+        raw = (completion.choices[0].message.content or "").strip()
+        logger.info("Clarification judge raw response: %s", raw)
+        verdict: dict[str, Any] = json.loads(raw)
+    except Exception:
+        logger.exception("Clarification judge call failed; defaulting to no clarification.")
+        return {
+            "requires_clarification": False,
+            "reasoning": "Judge call failed.",
+            "score": 0.0,
+            "distinct_pages": distinct_pages_original,
+            "followup": "",
+        }
+
+    # Normalise keys
+    verdict.setdefault("requires_clarification", False)
+    verdict.setdefault("reasoning", "")
+    verdict.setdefault("score", 0.0)
+    verdict.setdefault("distinct_pages", distinct_pages_original)
+    verdict.setdefault("followup", "")
+
+    # ── Gate 4: apply score threshold ─────────────────────────────────────
+    threshold = float(config.get("clarification_score_threshold", 0.8))
+    if verdict["requires_clarification"] and float(verdict["score"]) < threshold:
+        logger.info(
+            "Clarification judge said YES (score=%.2f) but below threshold (%.2f). Proceeding without clarification.",
+            float(verdict["score"]),
+            threshold,
+        )
+        verdict["requires_clarification"] = False
+        verdict["reasoning"] += f" [score {verdict['score']} below threshold {threshold}]"
+
+    logger.info(
+        "Clarification pre-check result: requires=%s, score=%.2f, pages=%s",
+        verdict["requires_clarification"],
+        float(verdict.get("score", 0)),
+        verdict.get("distinct_pages"),
+    )
+    return verdict
+
+
 async def rewrite_query_for_retrieval(
     *,
     config: dict[str, Any],
@@ -508,7 +697,7 @@ async def generate_answer_stream(
     context_block = f"<context>\n{source_block}\n</context>"
 
     system_prompt = """
-You are a precise AI assistant for a Data Intelligence Platform. You help users understand
+You are a precise AI assistant for a Business Intelligence WebApplication. You help users understand
 measures, calculations, and data logic using ONLY the retrieved documentation in <context>.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -579,9 +768,12 @@ SECTION 4 — CITATION
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 SECTION 5 — RESPONSE FORMAT
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-For measure_table chunks, format each entry as a flat bullet list (never nested).
-Omit any field that is absent from the chunk.
-Never output placeholder text for missing fields (for example: "Not explicitly mentioned", "N/A", "Unknown", "Not provided").
+- For measure_table chunks, format each entry as a flat bullet list (never nested).
+- Omit any field that is absent from the chunk.
+- Never output placeholder text for missing fields (for example: "Not explicitly mentioned", "N/A", "Unknown", "Not provided").
+- Only answer based on the retrieved documentation in <context>.
+- Do NOT hallucinate, infer, or use external knowledge.
+- Keep technical values (measure identifiers, formulas, table names, source files, and logic identifiers) exactly as in the source.
 
 English:
 - **Display Name**: [value]
@@ -756,7 +948,29 @@ async def chat(chat_request: ChatRequest) -> JSONResponse:
                     c["sourcepage"],
                     len(c["images"]),
                 )
-        
+
+        # ── Clarification pre-check (LLM-as-judge) ───────────────────
+        clarification = await check_clarification_needed(
+            config=config,
+            openai_client=openai_client_instance,
+            user_query=query,
+            citations=citations,
+        )
+        if clarification["requires_clarification"]:
+            logger.info("Clarification required — returning followup instead of answer.")
+            followup_answer = clarification["followup"]
+            response = build_chat_response(
+                answer=followup_answer,
+                citations=citations,
+                query=query,
+                retrieval_query=retrieval_query,
+                docs_count=len(docs),
+            )
+            response["context"]["thoughts"].append(
+                {"title": "Clarification judge", "description": clarification["reasoning"]}
+            )
+            return JSONResponse(response)
+
         answer = await generate_answer(
             config=config,
             openai_client=openai_client_instance,
@@ -816,6 +1030,31 @@ async def chat_stream(chat_request: ChatRequest) -> Response:
                 query=retrieval_query,
             )
             citations = build_citations(docs)
+
+            # ── Clarification pre-check (LLM-as-judge) ───────────────
+            clarification = await check_clarification_needed(
+                config=config,
+                openai_client=openai_client_instance,
+                user_query=retrieval_query,
+                citations=citations,
+            )
+            if clarification["requires_clarification"]:
+                logger.info("Clarification required (stream) — returning followup instead of answer.")
+                followup_answer = clarification["followup"]
+                # Send the followup as a single delta so the client renders it
+                yield (json.dumps({"type": "delta", "content": followup_answer}) + "\n").encode("utf-8")
+                response_payload = build_chat_response(
+                    answer=followup_answer,
+                    citations=citations,
+                    query=query,
+                    retrieval_query=retrieval_query,
+                    docs_count=len(docs),
+                )
+                response_payload["context"]["thoughts"].append(
+                    {"title": "Clarification judge", "description": clarification["reasoning"]}
+                )
+                yield (json.dumps({"type": "done", "response": response_payload}) + "\n").encode("utf-8")
+                return
 
             full_answer_parts: list[str] = []
             async for delta in generate_answer_stream(

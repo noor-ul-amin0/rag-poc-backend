@@ -70,6 +70,21 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("azure_storage_images_container_name", "AZURE_STORAGE_IMAGES_CONTAINER_NAME"),
     )
 
+    # Clarification pre-check (LLM-as-judge)
+    enable_clarification_precheck: bool = Field(
+        default=True,
+        description="When True, a lightweight LLM judge checks whether a queried measure "
+                    "appears on multiple pages and asks the user for clarification before "
+                    "generating the main answer.",
+        validation_alias=AliasChoices("enable_clarification_precheck", "ENABLE_CLARIFICATION_PRECHECK"),
+    )
+    clarification_score_threshold: float = Field(
+        default=0.8,
+        description="Minimum confidence score (0–1) from the clarification judge to "
+                    "actually surface the follow-up question to the user.",
+        validation_alias=AliasChoices("clarification_score_threshold", "CLARIFICATION_SCORE_THRESHOLD"),
+    )
+
     @model_validator(mode="after")
     def validate_required_fields(self) -> "Settings":
         required_fields = (
